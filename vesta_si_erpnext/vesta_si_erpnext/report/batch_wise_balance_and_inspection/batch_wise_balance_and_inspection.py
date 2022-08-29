@@ -10,7 +10,7 @@ from pypika.terms import JSON
 
 def execute(filters=None):
 	param_columns = get_params()
-	
+
 	if not filters: filters = {}
 	if filters.from_date > filters.to_date:
 		frappe.throw(_("From Date must be before To Date"))
@@ -30,10 +30,12 @@ def execute(filters=None):
 					if batch_dict.bal_qty:
 						row = [item, item_map[item]["item_name"], wh, batch,
 							flt(batch_dict.bal_qty, float_precision),
-							item_map[item]["stock_uom"], batch_dict.qi, batch_dict.desc, batch_dict.supplier_bag_no
+							item_map[item]["stock_uom"], batch_dict.qi
 						]
 						for param in param_columns:
 							row.append(batch_dict[param['col_name']])
+
+						row.extend([batch_dict.desc, batch_dict.supplier_bag_no])
 						data.append(row)
 
 	return columns, data
@@ -42,13 +44,18 @@ def execute(filters=None):
 def get_columns(filters, params):
 	"""return columns based on filters"""
 
-	columns = [_("Item") + ":Link/Item:100"] + [_("Item Name") + "::150"] + [_("Warehouse") + ":Link/Warehouse:100"] + \
-		[_("Batch") + ":Link/Batch:100"] + [_("Balance Qty") + ":Float:90"] + [_("UOM") + "::90"] + \
-		[_("Quality Inspection") + ":Link/Quality Inspection:140"] +[_("Description") + "::95"] + [_("Supplier Bag No.") + "::120"]
-	
+	columns = [_("Item") + ":Link/Item:100"] + [_("Item Name") + "::150"] + \
+		[_("Warehouse") + ":Link/Warehouse:100"] + \
+		[_("Batch") + ":Link/Batch:100"] + [_("Balance Qty") + ":Float:90"] + \
+		[_("UOM") + "::90"] + \
+		[_("Quality Inspection") + ":Link/Quality Inspection:140"]
+
+
 	for param in params:
-		columns += [_(param['inspection_parameter']) + ":Float:100"] 
-		
+		columns += [_(param['inspection_parameter']) + ":Float:100"]
+
+	columns += [_("Description") + "::95"] + [_("Supplier Bag No.") + "::120"]
+
 	return columns
 
 
@@ -64,8 +71,8 @@ def get_conditions(filters, params):
 
 	for field in ["item_code", "warehouse", "batch_no", "company"]:
 		if filters.get(field):
-			conditions += " and {0} = {1}".format(field, frappe.db.escape(filters.get(field)))
-	
+			conditions += " and s.{0} = {1}".format(field, frappe.db.escape(filters.get(field)))
+
 	for param in params:
 		if filters.get(param['col_name']):
 			parameter = '%' + filters.get(param['col_name']) + '%'
@@ -89,7 +96,7 @@ def get_stock_ledger_entries(filters, params):
 	col_conditions = ""
 	for col in params:
 		col_conditions += ", reading." + col['col_name'] + " as " + col['col_name']
-	
+
 	return frappe.db.sql("""
 		select s.item_code, s.batch_no, s.warehouse, s.posting_date, sum(s.actual_qty) as actual_qty,
 			se.quality_inspection as qi_name, se.supplier_bag_no as supplier_bag_no %s
@@ -97,13 +104,13 @@ def get_stock_ledger_entries(filters, params):
 		left join `tabStock Entry Detail` se on s.voucher_no = se.parent and se.batch_no= s.batch_no
 		left join (
 			select parent %s
-			from `tabQuality Inspection Reading` group by parent) as reading	
+			from `tabQuality Inspection Reading` group by parent) as reading
 		on se.quality_inspection = reading.parent
 		where s.is_cancelled = 0 and s.docstatus < 2 and ifnull(s.batch_no, '') != '' %s
 		group by voucher_no, batch_no, s.item_code, warehouse
 		order by s.item_code, warehouse""" %
 		(col_conditions, param_conditions, conditions), as_dict=1)
-	
+
 def get_item_warehouse_batch_map(filters, float_precision, params):
 	sle = get_stock_ledger_entries(filters, params)
 	iwb_map = {}
@@ -136,11 +143,13 @@ def get_item_warehouse_batch_map(filters, float_precision, params):
 
 @frappe.whitelist()
 def get_params():
+	import re
 	params =  frappe.db.get_values('Inspection Report Parameter',
 		{'parent': 'Quality Inspection Report Settings'},
 		['inspection_parameter'], order_by = 'idx', as_dict = 1)
 	for col in params:
-		col['col_name'] = col['inspection_parameter'].split()[0].lower()
+		col['col_name'] = re.sub('[^A-Za-z0-9]+', '', col['inspection_parameter'])
+
 	return params
 
 def get_batch_desc(batch_no):
@@ -158,16 +167,16 @@ def create_stock_entry(item_list):
 	stock_entry = frappe.new_doc('Stock Entry')
 	stock_entry.purpose = 'Material Transfer'
 
-	item_list_obj = json.loads(item_list)
-	#remove duplicates
-	final_list = [dict(t) for t in {tuple(d.items()) for d in item_list_obj}]
+	if isinstance(item_list, str):
+		item_list = json.loads(item_list)
 
-	for item_details in final_list:							
+	for key, item_details in item_list.items():
 		se_child = stock_entry.append('items')
 		se_child.s_warehouse = item_details["warehouse"]
-	
+		se_child.conversion_factor = 1
+
 		for field in ["item_code","uom","qty","quality_inspection",
-			 "item_name", "batch_no"]:
+			 "item_name", "batch_no", "stock_uom"]:
 			if item_details.get(field):
 				se_child.set(field, item_details.get(field))
 
@@ -185,21 +194,25 @@ def create_stock_entry(item_list):
 
 @frappe.whitelist()
 def create_certificate(item_list):
-	
-	item_list_obj = json.loads(item_list)
-	#remove duplicates
-	final_list = [dict(t) for t in {tuple(d.items()) for d in item_list_obj}]
+	if isinstance(item_list, str):
+		item_list = json.loads(item_list)
 
-	item_code = item_list_obj[0]["item_code"]
+	key = list(item_list.keys())[0]
+	item_code = item_list[key]["item_code"]
 	analytical_certificate = frappe.new_doc('Analytical Certificate Creation')
+	item_data = frappe.db.get_value("Item",
+		item_code, ["item_name", "description", "quality_inspection_template"], as_dict=1)
+
 	analytical_certificate.item_code = item_code
-	analytical_certificate.item_name = frappe.get_value("Item",item_code,"item_name")
-	
-	for item_details in final_list:	
-		if item_details["item_code"] != item_code:					
-			frappe.throw("Please select rows of same Item Code, to create a certificate!")
+	analytical_certificate.item_name = item_data.item_name
+	analytical_certificate.description = item_data.description
+	analytical_certificate.qi_template = item_data.quality_inspection_template
+
+	for key, item_details in item_list.items():
 		drum_child = analytical_certificate.append('batches')
 		drum_child.drum = item_details["batch_no"]
+		if item_details["batch_no"]:
+			drum_child.weight = frappe.db.get_value("Batch", item_details["batch_no"], "batch_qty")
 		qi_doc = frappe.get_doc("Quality Inspection",item_details["quality_inspection"])
 		qi_readings = qi_doc.get("readings")
 		for qi in qi_readings:
